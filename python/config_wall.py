@@ -399,7 +399,7 @@ def configMoldUserDashboard():
     cur.execute(user_dashboard_query)
     user_dashboard_val = cur.fetchone()
 
-    uri_val = '/d/' + user_dashboard_val[0] + '/' + user_dashboard_val[1]
+    uri_val = '/d/' + user_dashboard_val[0] + '/' + user_dashboard_val[1] + '?kiosk'
 
     conn.close()
 
