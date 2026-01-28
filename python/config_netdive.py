@@ -6,16 +6,14 @@ Copyright (c) 2021 ABLECLOUD Co. Ltd
 
 # !/usr/bin/python3
 # -*- coding: utf-8 -*-
-import asyncio
 import os
 import yaml
 import argparse
 import json
 import subprocess
-from subprocess import check_output
 from subprocess import call
 from ablestack import *
-import sh
+from sh import systemctl
 
 env=os.environ.copy()
 env['LANG']="en_US.utf-8"
@@ -110,6 +108,8 @@ def main():
     if (args.action) == 'config':
         try:
             configYaml(args.ccvm)
+            systemctl('enable', '--now', "netdive-analyzer")
+            systemctl('restart', "netdive-analyzer")
             result = SendCommandToHost(args.cube)
             if result == 200:
                 ret = createReturn(code=200, val="update netdive configuration")
