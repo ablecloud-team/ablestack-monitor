@@ -1,6 +1,7 @@
 {
     "web_timeout_seconds": 10,
     "qemu_agent_timeout_seconds": 1,
+    "domstats_timeout_seconds": 2,
     "mold_db_connect_timeout_seconds": 3,
     "fsinfo_interval_seconds": 3600,
     "enable_stats_perf": false,

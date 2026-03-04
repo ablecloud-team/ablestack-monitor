@@ -84,6 +84,7 @@ var excludedDomainNames = map[string]struct{}{}
 var password = ""
 var webTimeoutDuration = 10 * time.Second
 var qemuAgentTimeoutDuration = 1 * time.Second
+var domStatsTimeoutDuration = 2 * time.Second
 var fsInfoIntervalDuration = 0 * time.Second
 var enableStatsPerf = false
 var enableStatsVcpu = false
@@ -111,6 +112,11 @@ type fsInfoCacheEntry struct {
 
 var fsInfoCache = map[string]fsInfoCacheEntry{}
 var fsInfoCacheMutex sync.RWMutex
+
+type domainStatsResult struct {
+	stats []libvirt.DomainStats
+	err   error
+}
 
 type AESCipher struct {
 	block cipher.Block
@@ -1172,11 +1178,12 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 			}
 		}
 
-		stats, err := conn.GetAllDomainStats(
-			[]*libvirt.Domain{&domains[i]},
-			statsTypes,
-			libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT,
-		)
+		if domainName == "" {
+			log.Printf("Failed to get domain name: %s", err)
+			continue
+		}
+
+		stats, err := getDomainStatsWithTimeout(uri, domainName, statsTypes)
 		if err != nil {
 			log.Printf("Failed to get domain stats: %s", err)
 			continue
@@ -1197,6 +1204,50 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 		}(stats)
 	}
 	return nil
+}
+
+func getDomainStatsWithTimeout(
+	uri string,
+	domainName string,
+	statsTypes libvirt.DomainStatsTypes,
+) ([]libvirt.DomainStats, error) {
+	resultCh := make(chan domainStatsResult, 1)
+
+	go func() {
+		domainConn, err := libvirt.NewConnectReadOnly(uri)
+		if err != nil {
+			resultCh <- domainStatsResult{err: err}
+			return
+		}
+		defer domainConn.Close()
+
+		domain, err := domainConn.LookupDomainByName(domainName)
+		if err != nil {
+			resultCh <- domainStatsResult{err: err}
+			return
+		}
+		defer domain.Free()
+
+		stats, err := domainConn.GetAllDomainStats(
+			[]*libvirt.Domain{domain},
+			statsTypes,
+			libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT,
+		)
+		resultCh <- domainStatsResult{
+			stats: stats,
+			err:   err,
+		}
+	}()
+
+	timer := time.NewTimer(domStatsTimeoutDuration)
+	defer timer.Stop()
+
+	select {
+	case result := <-resultCh:
+		return result.stats, result.err
+	case <-timer.C:
+		return nil, fmt.Errorf("timed out after %s for domain %s", domStatsTimeoutDuration, domainName)
+	}
 }
 
 func memoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirtSchema.VirDomainMemoryStats {
@@ -1814,6 +1865,7 @@ func main() {
 	}
 	webTimeoutDuration = loadTimeoutFromConfig(confValue, "web_timeout_seconds", 10*time.Second)
 	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
+	domStatsTimeoutDuration = loadTimeoutFromConfig(confValue, "domstats_timeout_seconds", 2*time.Second)
 	fsInfoIntervalDuration = loadDurationSecondsFromConfig(confValue, "fsinfo_interval_seconds", 0*time.Second)
 	enableStatsPerf = loadBoolFromConfig(confValue, "enable_stats_perf", false)
 	enableStatsVcpu = loadBoolFromConfig(confValue, "enable_stats_vcpu", false)
