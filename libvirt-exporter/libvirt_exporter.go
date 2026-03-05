@@ -1211,6 +1211,14 @@ func getDomainStatsWithTimeout(
 	domainName string,
 	statsTypes libvirt.DomainStatsTypes,
 ) ([]libvirt.DomainStats, error) {
+	collectable, err := domainJobTypeIsNone(uri, domainName)
+	if err != nil {
+		return nil, err
+	}
+	if !collectable {
+		return []libvirt.DomainStats{}, nil
+	}
+
 	resultCh := make(chan domainStatsResult, 1)
 
 	go func() {
@@ -1248,6 +1256,34 @@ func getDomainStatsWithTimeout(
 	case <-timer.C:
 		return nil, fmt.Errorf("timed out after %s for domain %s", domStatsTimeoutDuration, domainName)
 	}
+}
+
+func domainJobTypeIsNone(uri string, domainName string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), domStatsTimeoutDuration)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, "virsh", "--connect", uri, "domjobinfo", domainName).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return false, fmt.Errorf("timed out after %s checking domjobinfo for domain %s", domStatsTimeoutDuration, domainName)
+	}
+	if err != nil {
+		errText := strings.TrimSpace(string(output))
+		if errText != "" {
+			return false, fmt.Errorf("virsh domjobinfo failed for %s: %s", domainName, errText)
+		}
+		return false, err
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Job type:") {
+			continue
+		}
+		jobType := strings.TrimSpace(strings.TrimPrefix(line, "Job type:"))
+		return jobType == "None", nil
+	}
+
+	return false, fmt.Errorf("virsh domjobinfo output missing job type for domain %s", domainName)
 }
 
 func memoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirtSchema.VirDomainMemoryStats {
