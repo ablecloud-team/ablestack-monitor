@@ -335,8 +335,8 @@ def configDS(scvm=None):  # 기본값 None 추가
     ds_update_query4 = "UPDATE data_source SET url = \'http://" + \
         "localhost:3001' WHERE name = 'Wall' AND org_id = '2'"
 
-    ds_update_query5 = "UPDATE data_source SET url = \'http://" + \
-            "127.0.0.1:3000' WHERE name = 'yesoreyeram-infinity-datasource'"
+    ds_update_query5 = "UPDATE data_source SET url = \'https://" + \
+            "ccvm:8081' WHERE name = 'yesoreyeram-infinity-datasource'"
 
     cur = conn.cursor()
     cur.execute(ds_update_query1)
