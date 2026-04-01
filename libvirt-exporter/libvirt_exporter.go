@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
@@ -32,6 +33,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/AlexZzz/libvirt-exporter/libvirtSchema"
 	_ "github.com/go-sql-driver/mysql"
@@ -77,7 +80,43 @@ var byteValue []uint8
 var domainMetaInfo = map[int]map[string]string{}
 var networkMetaInfo = map[int]map[string]string{}
 var diskMetaInfo = map[int]map[string]string{}
+var excludedDomainNames = map[string]struct{}{}
 var password = ""
+var webTimeoutDuration = 10 * time.Second
+var qemuAgentTimeoutDuration = 1 * time.Second
+var domStatsTimeoutDuration = 2 * time.Second
+var fsInfoIntervalDuration = 0 * time.Second
+var enableStatsPerf = false
+var enableStatsVcpu = false
+var enableDomainBlockIoTune = false
+var moldDbConnectTimeoutDuration = 3 * time.Second
+var moldMetaIntervalDuration = 120 * time.Second
+var moldMetaLastRefresh time.Time
+var moldMetaLastStatus = 0.0
+var moldMetaMutex sync.RWMutex
+
+type fsInfoMetric struct {
+	partitionName       string
+	partitionMountpoint string
+	partitionType       string
+	serial              string
+	totalBytes          float64
+	usedBytes           float64
+}
+
+type fsInfoCacheEntry struct {
+	updatedAt time.Time
+	status    float64
+	metrics   []fsInfoMetric
+}
+
+var fsInfoCache = map[string]fsInfoCacheEntry{}
+var fsInfoCacheMutex sync.RWMutex
+
+type domainStatsResult struct {
+	stats []libvirt.DomainStats
+	err   error
+}
 
 type AESCipher struct {
 	block cipher.Block
@@ -482,6 +521,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	domain_mold_name := domainName
 	display_mold_name := domainName
 	vm_user_name := "N/A"
+	moldMetaMutex.RLock()
 	for _, val := range domainMetaInfo {
 		if domainName == val["domain_name"] {
 			domain_mold_name = val["domain_mold_name"]
@@ -489,6 +529,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 			vm_user_name = val["vm_user_name"]
 		}
 	}
+	moldMetaMutex.RUnlock()
 
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMetaDesc,
@@ -562,6 +603,9 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 				domainName,
 				strconv.FormatInt(int64(vcpu.Number), 10))
 		}
+	}
+
+	if enableStatsVcpu {
 		/* There's no Wait in GetVcpus()
 		 * But there's no cpu number in libvirt.DomainStats
 		 * Time and State are present in both structs
@@ -614,6 +658,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		mold_disk_name := "N/A"
 		display_volume_name := disk.Name
 		mold_volume_type := "N/A"
+		moldMetaMutex.RLock()
 		for _, val := range diskMetaInfo {
 			if domainName == val["domain_name"] && strings.Contains(strings.ReplaceAll(DiskSource, "-", ""), strings.ReplaceAll(val["disk_path"], "-", "")) {
 				mold_disk_name = val["mold_disk_name"]
@@ -621,6 +666,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 				mold_volume_type = val["volume_type"]
 			}
 		}
+		moldMetaMutex.RUnlock()
 		ch <- prometheus.MustNewConstMetric(
 			libvirtDomainMetaBlockDesc,
 			prometheus.GaugeValue,
@@ -728,172 +774,174 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 				disk.Name)
 		}
 
-		blockIOTuneParams, err := stat.Domain.GetBlockIoTune(disk.Name, 0)
-		if err != nil {
-			lverr, ok := err.(libvirt.Error)
-			if !ok {
-				switch lverr.Code {
-				case libvirt.ERR_OPERATION_INVALID:
-					// This should be one-shot error
-					log.Printf("Invalid operation GetBlockIoTune: %s", err.Error())
-				case libvirt.ERR_OPERATION_UNSUPPORTED:
-					WriteErrorOnce("Unsupported operation GetBlockIoTune: "+err.Error(), "blkiotune_unsupported")
-				default:
-					return err
+		if enableDomainBlockIoTune {
+			blockIOTuneParams, err := stat.Domain.GetBlockIoTune(disk.Name, 0)
+			if err != nil {
+				lverr, ok := err.(libvirt.Error)
+				if !ok {
+					switch lverr.Code {
+					case libvirt.ERR_OPERATION_INVALID:
+						// This should be one-shot error
+						log.Printf("Invalid operation GetBlockIoTune: %s", err.Error())
+					case libvirt.ERR_OPERATION_UNSUPPORTED:
+						WriteErrorOnce("Unsupported operation GetBlockIoTune: "+err.Error(), "blkiotune_unsupported")
+					default:
+						return err
+					}
 				}
-			}
-		} else {
-			if blockIOTuneParams.TotalBytesSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockTotalBytesSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.TotalBytesSec),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.ReadBytesSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockReadBytesSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.ReadBytesSec),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.WriteBytesSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockWriteBytesSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.WriteBytesSec),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.TotalIopsSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockTotalIopsSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.TotalIopsSec),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.ReadIopsSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockReadIopsSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.ReadIopsSec),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.WriteIopsSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockWriteIopsSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.WriteIopsSec),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.TotalBytesSecMaxSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockTotalBytesSecMaxDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.TotalBytesSecMax),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.ReadBytesSecMaxSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockReadBytesSecMaxDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.ReadBytesSecMax),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.WriteBytesSecMaxSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockWriteBytesSecMaxDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.WriteBytesSecMax),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.TotalIopsSecMaxSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockTotalIopsSecMaxDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.TotalIopsSecMax),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.ReadIopsSecMaxSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockReadIopsSecMaxDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.ReadIopsSecMax),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.WriteIopsSecMaxSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockWriteIopsSecMaxDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.WriteIopsSecMax),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.TotalBytesSecMaxLengthSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockTotalBytesSecMaxLengthDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.TotalBytesSecMaxLength),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.ReadBytesSecMaxLengthSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockReadBytesSecMaxLengthDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.ReadBytesSecMaxLength),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.WriteBytesSecMaxLengthSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockWriteBytesSecMaxLengthDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.WriteBytesSecMaxLength),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.TotalIopsSecMaxLengthSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockTotalIopsSecMaxLengthDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.TotalIopsSecMaxLength),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.ReadIopsSecMaxLengthSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockReadIopsSecMaxLengthDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.ReadIopsSecMaxLength),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.WriteIopsSecMaxLengthSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockWriteIopsSecMaxLengthDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.WriteIopsSecMaxLength),
-					domainName,
-					disk.Name)
-			}
-			if blockIOTuneParams.SizeIopsSecSet {
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainBlockSizeIopsSecDesc,
-					prometheus.GaugeValue,
-					float64(blockIOTuneParams.SizeIopsSec),
-					domainName,
-					disk.Name)
+			} else {
+				if blockIOTuneParams.TotalBytesSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockTotalBytesSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.TotalBytesSec),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.ReadBytesSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockReadBytesSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.ReadBytesSec),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.WriteBytesSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockWriteBytesSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.WriteBytesSec),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.TotalIopsSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockTotalIopsSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.TotalIopsSec),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.ReadIopsSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockReadIopsSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.ReadIopsSec),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.WriteIopsSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockWriteIopsSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.WriteIopsSec),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.TotalBytesSecMaxSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockTotalBytesSecMaxDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.TotalBytesSecMax),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.ReadBytesSecMaxSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockReadBytesSecMaxDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.ReadBytesSecMax),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.WriteBytesSecMaxSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockWriteBytesSecMaxDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.WriteBytesSecMax),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.TotalIopsSecMaxSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockTotalIopsSecMaxDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.TotalIopsSecMax),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.ReadIopsSecMaxSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockReadIopsSecMaxDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.ReadIopsSecMax),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.WriteIopsSecMaxSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockWriteIopsSecMaxDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.WriteIopsSecMax),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.TotalBytesSecMaxLengthSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockTotalBytesSecMaxLengthDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.TotalBytesSecMaxLength),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.ReadBytesSecMaxLengthSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockReadBytesSecMaxLengthDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.ReadBytesSecMaxLength),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.WriteBytesSecMaxLengthSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockWriteBytesSecMaxLengthDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.WriteBytesSecMaxLength),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.TotalIopsSecMaxLengthSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockTotalIopsSecMaxLengthDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.TotalIopsSecMaxLength),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.ReadIopsSecMaxLengthSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockReadIopsSecMaxLengthDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.ReadIopsSecMaxLength),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.WriteIopsSecMaxLengthSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockWriteIopsSecMaxLengthDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.WriteIopsSecMaxLength),
+						domainName,
+						disk.Name)
+				}
+				if blockIOTuneParams.SizeIopsSecSet {
+					ch <- prometheus.MustNewConstMetric(
+						libvirtDomainBlockSizeIopsSecDesc,
+						prometheus.GaugeValue,
+						float64(blockIOTuneParams.SizeIopsSec),
+						domainName,
+						disk.Name)
+				}
 			}
 		}
 	}
@@ -918,11 +966,13 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		if SourceBridge != "" || VirtualInterface != "" || MacAddress != "" {
 
 			mold_network_name := "N/A"
+			moldMetaMutex.RLock()
 			for _, val := range networkMetaInfo {
 				if MacAddress == val["mac_addr"] && val["mold_network_name"] != "%!s(<nil>)" {
 					mold_network_name = val["mold_network_name"]
 				}
 			}
+			moldMetaMutex.RUnlock()
 
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainMetaInterfacesDesc,
@@ -1002,10 +1052,10 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	}
 
 	// Collect Memory Stats
-	memorystat, err := stat.Domain.MemoryStats(11, 0)
+	memorystat, memErr := stat.Domain.MemoryStats(11, 0)
 	var MemoryStats libvirtSchema.VirDomainMemoryStats
 	var usedPercent float64
-	if err == nil {
+	if memErr == nil {
 		MemoryStats = memoryStatCollect(&memorystat)
 		if MemoryStats.Usable != 0 && MemoryStats.Available != 0 {
 			usedPercent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available) / float64(100))
@@ -1096,26 +1146,144 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 		libvirtdVersion,
 		libraryVersion)
 
-	stats, err := conn.GetAllDomainStats([]*libvirt.Domain{}, libvirt.DOMAIN_STATS_STATE|libvirt.DOMAIN_STATS_CPU_TOTAL|
-		libvirt.DOMAIN_STATS_INTERFACE|libvirt.DOMAIN_STATS_BALLOON|libvirt.DOMAIN_STATS_BLOCK|
-		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU,
-		//libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT, // maybe in future
-		libvirt.CONNECT_GET_ALL_DOMAINS_STATS_RUNNING|libvirt.CONNECT_GET_ALL_DOMAINS_STATS_SHUTOFF)
-	defer func(stats []libvirt.DomainStats) {
-		for _, stat := range stats {
-			stat.Domain.Free()
-		}
-	}(stats)
+	domains, err := conn.ListAllDomains(libvirt.CONNECT_LIST_DOMAINS_RUNNING)
 	if err != nil {
 		return err
 	}
-	for _, stat := range stats {
-		err = CollectDomain(ch, stat)
-		if err != nil {
-			log.Printf("Failed to scrape metrics: %s", err)
+	defer func(domains []libvirt.Domain) {
+		for i := range domains {
+			domains[i].Free()
 		}
+	}(domains)
+
+	statsTypes := libvirt.DOMAIN_STATS_STATE | libvirt.DOMAIN_STATS_CPU_TOTAL |
+		libvirt.DOMAIN_STATS_INTERFACE | libvirt.DOMAIN_STATS_BALLOON |
+		libvirt.DOMAIN_STATS_BLOCK | libvirt.DOMAIN_STATS_VCPU | libvirt.DOMAIN_STATS_MEMORY
+	if enableStatsPerf {
+		statsTypes |= libvirt.DOMAIN_STATS_PERF
+	}
+
+	for i := range domains {
+		domainName, err := domains[i].GetName()
+		if err == nil {
+			excluded := false
+			for pattern := range excludedDomainNames {
+				if strings.HasPrefix(domainName, pattern) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+
+		if domainName == "" {
+			log.Printf("Failed to get domain name: %s", err)
+			continue
+		}
+
+		stats, err := getDomainStatsWithTimeout(uri, domainName, statsTypes)
+		if err != nil {
+			log.Printf("Failed to get domain stats: %s", err)
+			continue
+		}
+
+		func(stats []libvirt.DomainStats) {
+			defer func(stats []libvirt.DomainStats) {
+				for _, stat := range stats {
+					stat.Domain.Free()
+				}
+			}(stats)
+
+			for _, stat := range stats {
+				if err := CollectDomain(ch, stat); err != nil {
+					log.Printf("Failed to scrape metrics: %s", err)
+				}
+			}
+		}(stats)
 	}
 	return nil
+}
+
+func getDomainStatsWithTimeout(
+	uri string,
+	domainName string,
+	statsTypes libvirt.DomainStatsTypes,
+) ([]libvirt.DomainStats, error) {
+	collectable, err := domainJobTypeIsNone(uri, domainName)
+	if err != nil {
+		return nil, err
+	}
+	if !collectable {
+		return []libvirt.DomainStats{}, nil
+	}
+
+	resultCh := make(chan domainStatsResult, 1)
+
+	go func() {
+		domainConn, err := libvirt.NewConnectReadOnly(uri)
+		if err != nil {
+			resultCh <- domainStatsResult{err: err}
+			return
+		}
+		defer domainConn.Close()
+
+		domain, err := domainConn.LookupDomainByName(domainName)
+		if err != nil {
+			resultCh <- domainStatsResult{err: err}
+			return
+		}
+		defer domain.Free()
+
+		stats, err := domainConn.GetAllDomainStats(
+			[]*libvirt.Domain{domain},
+			statsTypes,
+			libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT,
+		)
+		resultCh <- domainStatsResult{
+			stats: stats,
+			err:   err,
+		}
+	}()
+
+	timer := time.NewTimer(domStatsTimeoutDuration)
+	defer timer.Stop()
+
+	select {
+	case result := <-resultCh:
+		return result.stats, result.err
+	case <-timer.C:
+		return nil, fmt.Errorf("timed out after %s for domain %s", domStatsTimeoutDuration, domainName)
+	}
+}
+
+func domainJobTypeIsNone(uri string, domainName string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), domStatsTimeoutDuration)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, "virsh", "--connect", uri, "domjobinfo", domainName).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return false, fmt.Errorf("timed out after %s checking domjobinfo for domain %s", domStatsTimeoutDuration, domainName)
+	}
+	if err != nil {
+		errText := strings.TrimSpace(string(output))
+		if errText != "" {
+			return false, fmt.Errorf("virsh domjobinfo failed for %s: %s", domainName, errText)
+		}
+		return false, err
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Job type:") {
+			continue
+		}
+		jobType := strings.TrimSpace(strings.TrimPrefix(line, "Job type:"))
+		return jobType == "None", nil
+	}
+
+	return false, fmt.Errorf("virsh domjobinfo output missing job type for domain %s", domainName)
 }
 
 func memoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirtSchema.VirDomainMemoryStats {
@@ -1267,9 +1435,128 @@ func (a *AESCipher) DecryptString(base64String string) string {
 	return decPw
 }
 
+func loadTimeoutFromConfig(conf map[string]interface{}, key string, defaultTimeout time.Duration) time.Duration {
+	raw, ok := conf[key]
+	if !ok {
+		return defaultTimeout
+	}
+
+	switch v := raw.(type) {
+	case float64:
+		if v > 0 {
+			return time.Duration(v * float64(time.Second))
+		}
+	case string:
+		sec, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+
+	log.Printf("invalid %s value in conf.json, using default %s", key, defaultTimeout)
+	return defaultTimeout
+}
+
+func loadDurationSecondsFromConfig(conf map[string]interface{}, key string, defaultValue time.Duration) time.Duration {
+	raw, ok := conf[key]
+	if !ok {
+		return defaultValue
+	}
+
+	parseSeconds := func(sec int) time.Duration {
+		if sec < 0 {
+			return time.Duration(-1) * time.Second
+		}
+		return time.Duration(sec) * time.Second
+	}
+
+	switch v := raw.(type) {
+	case float64:
+		return parseSeconds(int(v))
+	case string:
+		sec, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			return parseSeconds(sec)
+		}
+	}
+
+	log.Printf("invalid %s value in conf.json, using default %s", key, defaultValue)
+	return defaultValue
+}
+
+func loadBoolFromConfig(conf map[string]interface{}, key string, defaultValue bool) bool {
+	raw, ok := conf[key]
+	if !ok {
+		return defaultValue
+	}
+
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err == nil {
+			return parsed
+		}
+	}
+
+	log.Printf("invalid %s value in conf.json, using default %t", key, defaultValue)
+	return defaultValue
+}
+
+func loadStringSetFromConfig(conf map[string]interface{}, key string) map[string]struct{} {
+	result := make(map[string]struct{})
+
+	raw, ok := conf[key]
+	if !ok {
+		return result
+	}
+
+	switch v := raw.(type) {
+	case []interface{}:
+		for _, item := range v {
+			name, ok := item.(string)
+			if !ok {
+				continue
+			}
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			result[name] = struct{}{}
+		}
+	case string:
+		for _, item := range strings.Split(v, ",") {
+			name := strings.TrimSpace(item)
+			if name == "" {
+				continue
+			}
+			result[name] = struct{}{}
+		}
+	default:
+		log.Printf("invalid %s value in conf.json, expected array or comma-separated string", key)
+	}
+
+	return result
+}
+
 func CollectMoldMeta(ch chan<- prometheus.Metric) {
-	//conf 파일을 파싱하여 json으로 변환
-	json.Unmarshal([]byte(byteValue), &confValue)
+	if moldMetaIntervalDuration > 0 {
+		moldMetaMutex.RLock()
+		useCache := !moldMetaLastRefresh.IsZero() && time.Since(moldMetaLastRefresh) < moldMetaIntervalDuration
+		cachedStatus := moldMetaLastStatus
+		moldMetaMutex.RUnlock()
+
+		if useCache {
+			ch <- prometheus.MustNewConstMetric(
+				libvirtMoldCollectDesc,
+				prometheus.GaugeValue,
+				cachedStatus)
+			return
+		}
+	}
 
 	moldDbConf := confValue["mold_db"].(map[string]interface{})
 	serverhost := moldDbConf["serverhost"].(string)
@@ -1277,7 +1564,11 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 	database := moldDbConf["database"].(string)
 	username := moldDbConf["username"].(string)
 	statusVal := 1.0
+	refreshAt := time.Now()
 	enpw := moldDbConf["password"].(string) // pw_encryption.go 파일로 암호화시킨 비밀번호
+	domainMetaInfoTemp := map[int]map[string]string{}
+	networkMetaInfoTemp := map[int]map[string]string{}
+	diskMetaInfoTemp := map[int]map[string]string{}
 
 	//키는 16, 24, 32만 가능합니다
 	var key = []byte("ablestackwallkey") // pw_encryption.go 에서 암호화 한 방식과 동일한 key
@@ -1288,9 +1579,12 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 	}
 
 	// sql.DB 객체 생성
-	db, err := sql.Open("mysql", username+":"+password+"@tcp("+serverhost+":"+port+")/"+database)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?timeout=%s",
+		username, password, serverhost, port, database, moldDbConnectTimeoutDuration)
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		log.Println(err)
+		statusVal = 0.0
 	} else {
 		defer db.Close()
 
@@ -1335,7 +1629,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 					tmp_struct[col] = fmt.Sprintf("%s", v)
 				}
 
-				domainMetaInfo[result_id] = tmp_struct
+				domainMetaInfoTemp[result_id] = tmp_struct
 				result_id++
 			}
 
@@ -1387,7 +1681,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 					tmp_struct[col] = fmt.Sprintf("%s", v)
 				}
 
-				networkMetaInfo[result_id] = tmp_struct
+				networkMetaInfoTemp[result_id] = tmp_struct
 				result_id++
 			}
 
@@ -1440,7 +1734,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 					tmp_struct[col] = fmt.Sprintf("%s", v)
 				}
 
-				diskMetaInfo[result_id] = tmp_struct
+				diskMetaInfoTemp[result_id] = tmp_struct
 				result_id++
 			}
 
@@ -1449,111 +1743,130 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	moldMetaMutex.Lock()
+	if statusVal == 1.0 {
+		domainMetaInfo = domainMetaInfoTemp
+		networkMetaInfo = networkMetaInfoTemp
+		diskMetaInfo = diskMetaInfoTemp
+	}
+	moldMetaLastStatus = statusVal
+	moldMetaLastRefresh = refreshAt
+	moldMetaMutex.Unlock()
+
 	ch <- prometheus.MustNewConstMetric(
 		libvirtMoldCollectDesc,
 		prometheus.GaugeValue,
 		statusVal)
 }
 
-func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
-	// 실행할 셸 명령과 인자들
-	cmd := exec.Command("virsh", "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
+func emitFsInfoMetrics(domainName string, entry fsInfoCacheEntry, ch chan<- prometheus.Metric) {
+	for _, metric := range entry.metrics {
+		ch <- prometheus.MustNewConstMetric(
+			libvirtDomainFsInfoTotalBytesDesc,
+			prometheus.GaugeValue,
+			metric.totalBytes,
+			domainName,
+			metric.partitionName,
+			metric.partitionMountpoint,
+			metric.partitionType,
+			metric.serial)
 
-	// 명령 실행 및 결과 처리
+		ch <- prometheus.MustNewConstMetric(
+			libvirtDomainFsInfoUsageBytesDesc,
+			prometheus.GaugeValue,
+			metric.usedBytes,
+			domainName,
+			metric.partitionName,
+			metric.partitionMountpoint,
+			metric.partitionType,
+			metric.serial)
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainFsInfoAgentStatusDesc,
+		prometheus.GaugeValue,
+		entry.status,
+		domainName)
+}
+
+func collectFsInfo(domainName string) fsInfoCacheEntry {
+	entry := fsInfoCacheEntry{
+		updatedAt: time.Now(),
+		status:    1, // command or parse error by default
+		metrics:   []fsInfoMetric{},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), qemuAgentTimeoutDuration)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "virsh", "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
+
 	jsonString, err := cmd.CombinedOutput()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainFsInfoAgentStatusDesc,
-			prometheus.GaugeValue,
-			float64(1),
-			domainName)
-		// fmt.Println("에러 발생:", err)
-		return
+		return entry
 	}
 
-	jsonBytes := []byte(jsonString)
-	// JSON 디코딩하여 구조체에 저장
 	var data ReturnData
-	err = json.Unmarshal(jsonBytes, &data)
-	if err != nil {
-		// fmt.Println("JSON 파싱 오류:", err)
+	if err := json.Unmarshal(jsonString, &data); err != nil {
+		return entry
+	}
+
+	notSupportedAgent := true
+	for _, partition := range data.Return {
+		if len(partition.Disk) == 0 || partition.TotalBytes <= 0 {
+			continue
+		}
+
+		notSupportedAgent = false
+		serial := ""
+		for _, disk := range partition.Disk {
+			if len(disk.Serial) >= 20 {
+				serial = disk.Serial[len(disk.Serial)-20:]
+			} else {
+				serial = disk.Serial
+			}
+		}
+
+		entry.metrics = append(entry.metrics, fsInfoMetric{
+			partitionName:       partition.Name,
+			partitionMountpoint: partition.Mountpoint,
+			partitionType:       partition.Type,
+			serial:              serial,
+			totalBytes:          float64(partition.TotalBytes),
+			usedBytes:           float64(partition.UsedBytes),
+		})
+	}
+
+	if notSupportedAgent {
+		entry.status = 2
+	} else {
+		entry.status = 0
+	}
+	return entry
+}
+
+func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
+	if fsInfoIntervalDuration < 0 {
 		return
 	}
 
-	// 데이터 출력
-	var notSupportedAgnet bool = true
-	for _, partition := range data.Return {
-		// 디스크 정보가 null이면 제외
-		// 총 용량이 0이면 제외
-		if len(partition.Disk) != 0 {
-			var serial string = ""
-			// fmt.Println("-----------------------------------")
-			// fmt.Printf("가상머신 이름: %s\n", domainName)
-			// fmt.Printf("파티션 이름: %s\n", partition.Name)
-			// fmt.Printf("총 용량(bytes): %d\n", partition.TotalBytes)
-			// fmt.Printf("마운트 포인트: %s\n", partition.Mountpoint)
-			// fmt.Printf("사용 용량(bytes): %d\n", partition.UsedBytes)
-			// fmt.Printf("파티션 타입: %s\n", partition.Type)
-			// fmt.Println("디스크 정보:")
-
-			for _, disk := range partition.Disk {
-				// 마지막 16자리 단어 구하기 (시리얼 정보)
-				length := len(disk.Serial)
-				var last20 string
-				if length >= 20 {
-					last20 = disk.Serial[length-20:]
-				} else {
-					last20 = disk.Serial // 문자열이 16자리보다 짧을 경우 전체 문자열 반환
-				}
-				serial = last20
-				// serial = disk.Serial
-				// fmt.Printf("- 시리얼 번호: %s\n", disk.Serial)
-				// fmt.Printf("- 버스 타입: %s\n", disk.BusType)
-				// fmt.Printf("  버스: %d\n", disk.Bus)
-				// fmt.Printf("  PCI 컨트롤러: Bus %d, Slot %d, Domain %d, Function %d\n",
-				// 	disk.PCIController.Bus, disk.PCIController.Slot, disk.PCIController.Domain, disk.PCIController.Function)
-				// fmt.Printf("  장치 경로: %s\n", disk.Dev)
-				// fmt.Printf("  타겟: %d\n", disk.Target)
-			}
-
-			if partition.TotalBytes > 0 {
-				notSupportedAgnet = false
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainFsInfoTotalBytesDesc,
-					prometheus.GaugeValue,
-					float64(partition.TotalBytes),
-					domainName,
-					partition.Name,
-					partition.Mountpoint,
-					partition.Type,
-					serial)
-
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainFsInfoUsageBytesDesc,
-					prometheus.GaugeValue,
-					float64(partition.UsedBytes),
-					domainName,
-					partition.Name,
-					partition.Mountpoint,
-					partition.Type,
-					serial)
-			}
+	if fsInfoIntervalDuration > 0 {
+		fsInfoCacheMutex.RLock()
+		cached, ok := fsInfoCache[domainName]
+		fsInfoCacheMutex.RUnlock()
+		if ok && time.Since(cached.updatedAt) < fsInfoIntervalDuration {
+			emitFsInfoMetrics(domainName, cached, ch)
+			return
 		}
 	}
 
-	if notSupportedAgnet {
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainFsInfoAgentStatusDesc,
-			prometheus.GaugeValue,
-			float64(2),
-			domainName)
-	} else {
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainFsInfoAgentStatusDesc,
-			prometheus.GaugeValue,
-			float64(0),
-			domainName)
+	entry := collectFsInfo(domainName)
+	if fsInfoIntervalDuration > 0 {
+		fsInfoCacheMutex.Lock()
+		fsInfoCache[domainName] = entry
+		fsInfoCacheMutex.Unlock()
 	}
+	emitFsInfoMetrics(domainName, entry, ch)
 }
 
 func main() {
@@ -1578,8 +1891,24 @@ func main() {
 	// defer the closing of our jsonFile so that we can parse it later on
 	defer jsonFile.Close()
 
-	val, _ := ioutil.ReadAll(jsonFile)
+	val, err := ioutil.ReadAll(jsonFile)
+	if err != nil {
+		log.Fatal(err)
+	}
 	byteValue = val
+	if err := json.Unmarshal(byteValue, &confValue); err != nil {
+		log.Fatal(err)
+	}
+	webTimeoutDuration = loadTimeoutFromConfig(confValue, "web_timeout_seconds", 10*time.Second)
+	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
+	domStatsTimeoutDuration = loadTimeoutFromConfig(confValue, "domstats_timeout_seconds", 2*time.Second)
+	fsInfoIntervalDuration = loadDurationSecondsFromConfig(confValue, "fsinfo_interval_seconds", 0*time.Second)
+	enableStatsPerf = loadBoolFromConfig(confValue, "enable_stats_perf", false)
+	enableStatsVcpu = loadBoolFromConfig(confValue, "enable_stats_vcpu", false)
+	enableDomainBlockIoTune = loadBoolFromConfig(confValue, "enable_domain_block_io_tune", false)
+	moldDbConnectTimeoutDuration = loadTimeoutFromConfig(confValue, "mold_db_connect_timeout_seconds", 3*time.Second)
+	moldMetaIntervalDuration = loadDurationSecondsFromConfig(confValue, "mold_meta_interval_seconds", 120*time.Second)
+	excludedDomainNames = loadStringSetFromConfig(confValue, "exclude_domain_names")
 
 	exporter, err := NewLibvirtExporter(*libvirtURI)
 	if err != nil {
@@ -1598,5 +1927,14 @@ func main() {
 			</body>
 			</html>`))
 	})
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	server := &http.Server{
+		Addr:              *listenAddress,
+		Handler:           nil,
+		ReadHeaderTimeout: webTimeoutDuration,
+		ReadTimeout:       webTimeoutDuration,
+		WriteTimeout:      webTimeoutDuration,
+		IdleTimeout:       webTimeoutDuration,
+	}
+
+	log.Fatal(server.ListenAndServe())
 }

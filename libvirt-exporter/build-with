@@ -21,7 +21,7 @@ BINARY_NAME=libvirt-exporter
 
 docker build -t libvirtexporterbuild -f ${DOCKERFILE} .
 docker run --rm \
-  -v "$PWD":/libvirt-exporter -w /libvirt-exporter \
+  -v "$PWD":/libvirt-exporter:Z -w /libvirt-exporter \
   -e GOOS=linux \
   -e GOARCH=amd64 \
    libvirtexporterbuild:latest go build -mod vendor -o ${BINARY_NAME}
