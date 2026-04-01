@@ -363,8 +363,11 @@ def configSkydiveLink(ccvm):
     cur.execute("SELECT id, data FROM dashboard WHERE org_id = 1 AND data LIKE '%:8082%'")
     rows = cur.fetchall()
 
-    pattern = re.compile(r"http://(?:\d{1,3}\.){3}\d{1,3}:8082(?P<tail>[^\"'\s]*)")
-    replacement = rf"http://{ccvm_ip}:8082\g<tail>"
+    # 수정 1: https? 를 사용하여 http:// 와 https:// 모두 매칭되도록 변경
+    pattern = re.compile(r"https?://(?:\d{1,3}\.){3}\d{1,3}:8082(?P<tail>[^\"'\s]*)")
+
+    # 수정 2: 치환될 결과를 무조건 https:// 로 고정
+    replacement = rf"https://{ccvm_ip}:8082\g<tail>"
 
     updated = 0
     for id_, data in rows:
@@ -420,12 +423,15 @@ def configMoldUserDashboard():
 
 # DB 파일 초기화 (기존 초기 파일로 되돌리기)
 def initDB():
-    if os_type == "ablestack-hci":
+    hci_types = ["ablestack-hci", "ablestack-hci-filesystem"]
+
+    if os_type in hci_types:
         cp("-f", "/usr/share/ablestack/ablestack-wall/grafana/data/grafana_org.db",
-        "/usr/share/ablestack/ablestack-wall/grafana/data/grafana.db")
+           "/usr/share/ablestack/ablestack-wall/grafana/data/grafana.db")
     else:
+        # 그 외의 경우 gfs용 DB 사용
         cp("-f", "/usr/share/ablestack/ablestack-wall/grafana/data/grafana_gfs.db",
-        "/usr/share/ablestack/ablestack-wall/grafana/data/grafana.db")
+           "/usr/share/ablestack/ablestack-wall/grafana/data/grafana.db")
 
     # WAL/SHM 파일 제거
     try:
