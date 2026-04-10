@@ -21,6 +21,8 @@ from sh import cp
 from sh import systemctl
 from sh import ssh
 from sh import python3
+from sh import Command
+from sh import ErrorReturnCode
 
 # prometheus에서 수집하는 exporter 및 서비스 포트
 wall_prometheus_port = ":3001"
@@ -33,6 +35,12 @@ cube_service_port = ":9090"
 mold_service_port = ":8080"
 mold_db_port = ":3306"
 glue_prometheus_port = ":9095"
+
+ROOT_CA_CERT_PATH = "/usr/share/ablestack/ablestack-wall/grafana/tls/rootCA.crt"
+OS_TRUST_ANCHOR_PATH = "/etc/pki/ca-trust/source/anchors/ablestack-rootca.crt"
+JAVA_TRUSTSTORE_PATH = "/etc/pki/java/cacerts"
+JAVA_TRUSTSTORE_PASSWORD = "changeit"
+JAVA_TRUSTSTORE_ALIAS = "ablestack-wall"
 
 '''
 함수명 : parseArgs
@@ -421,6 +429,34 @@ def configMoldUserDashboard():
     cloud_db.commit()
     cloud_db.close()
 
+
+def configTrustStore():
+    if not os.path.exists(ROOT_CA_CERT_PATH):
+        raise FileNotFoundError(ROOT_CA_CERT_PATH)
+
+    cp("-f", ROOT_CA_CERT_PATH, OS_TRUST_ANCHOR_PATH)
+    Command("update-ca-trust")()
+
+    keytool = Command("keytool")
+    try:
+        keytool(
+            "-delete",
+            "-alias", JAVA_TRUSTSTORE_ALIAS,
+            "-keystore", JAVA_TRUSTSTORE_PATH,
+            "-storepass", JAVA_TRUSTSTORE_PASSWORD
+        )
+    except ErrorReturnCode:
+        pass
+
+    keytool(
+        "-importcert",
+        "-noprompt",
+        "-alias", JAVA_TRUSTSTORE_ALIAS,
+        "-file", ROOT_CA_CERT_PATH,
+        "-keystore", JAVA_TRUSTSTORE_PATH,
+        "-storepass", JAVA_TRUSTSTORE_PASSWORD
+    )
+
 # DB 파일 초기화 (기존 초기 파일로 되돌리기)
 def initDB():
     hci_types = ["ablestack-hci", "ablestack-hci-filesystem"]
@@ -473,6 +509,7 @@ def main():
         if os_type == "ablestack-hci":
             try:
                 os.system("rm -rf cd /nfs/prometheus/ > /dev/null")
+                configTrustStore()
                 initDB()
                 configYaml(args.cube, args.ccvm, args.scvm)
                 configIni(args.ccvm)
@@ -489,6 +526,7 @@ def main():
                 print(json.dumps(json.loads(ret), indent=4))
         else:
             try:
+                configTrustStore()
                 initDB()
                 configYaml(args.cube, args.ccvm)
                 configIni(args.ccvm)
