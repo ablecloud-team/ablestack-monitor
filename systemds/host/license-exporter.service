@@ -1,0 +1,15 @@
+[Unit]
+Description=ABLESTACK License Exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/sysconfig/license-exporter
+ExecStart=/usr/bin/python3 /usr/share/ablestack/ablestack-wall/license-exporter/license_exporter.py
+
+[Install]
+WantedBy=multi-user.target
