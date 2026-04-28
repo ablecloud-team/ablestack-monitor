@@ -29,6 +29,12 @@ scrape_configs:
   static_configs:
   - targets:
     - 10.10.1.10:3003
+- job_name: host-license
+  static_configs:
+  - targets:
+    - 10.10.1.1:3007
+    - 10.10.1.2:3007
+    - 10.10.1.3:3007
 - job_name: cube-process-exporter
   metric_relabel_configs:
   - regex: (.*);(.*);(.*);(.*);(.*)

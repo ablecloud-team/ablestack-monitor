@@ -50,7 +50,7 @@ prometheus/license-exporter.scrape.yml.example
 ```bash
 LICENSE_EXPORTER_SOURCE=host_api \
 LICENSE_EXPORTER_API_URL=https://127.0.0.1:8080/api/v1/license/isLicenseExpired \
-/usr/bin/python3 /usr/share/ablestack/ablestack-wall/license-exporter/license_exporter.py
+/usr/bin/python3 /usr/share/ablestack/ablestack-wall/license-exporter.env/license_exporter.py
 ```
 
 기본 listen 포트는 `3007`, metrics path는 `/metrics` 입니다.

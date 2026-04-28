@@ -8,7 +8,7 @@ Type=simple
 User=root
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-/etc/sysconfig/license-exporter
+EnvironmentFile=-/usr/share/ablestack/ablestack-wall/license-exporter/config/license-exporter.env
 ExecStart=/usr/bin/python3 /usr/share/ablestack/ablestack-wall/license-exporter/license_exporter.py
 
 [Install]
