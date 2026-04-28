@@ -31,6 +31,7 @@ node_exporter_port = ":3003"
 process_exporter_port = ":3004"
 blackbox_exporter_port = ":3005"
 ipmi_exporter_port = ":3006"
+license_exporter_port = ":3007"
 cube_service_port = ":9090"
 mold_service_port = ":8080"
 mold_db_port = ":3306"
@@ -117,18 +118,26 @@ def ipmiConfig(cube_ip):
         cube[i] = cube[i] + ipmi_exporter_port
     return cube
 
+def appendPort(ip_list, port):
+    targets = ip_list.copy()
+    for i in range(len(targets)):
+        targets[i] = targets[i] + port
+    return targets
+
 def scvmNodeConfig(scvm_ip):
     scvm = scvm_ip.copy()
     for i in range(len(scvm)):
         scvm[i] = scvm[i] + node_exporter_port
     return scvm
 
-
 def ccvmNodeConfig(ccvm_ip):
     ccvm = ccvm_ip.copy()
     for i in range(len(ccvm)):
         ccvm[i] = ccvm[i] + node_exporter_port
     return ccvm
+
+def hostLicenseConfig(cube_ip):
+    return appendPort(cube_ip, license_exporter_port)
 
 
 def wallPrometheusConfig(ccvm_ip):
@@ -190,6 +199,19 @@ def ccvmBlackboxConfigReplacement(ccvm_ip):
     for i in range(len(ccvm)):
         ccvm[i] = ccvm[i] + blackbox_exporter_port
     return ccvm
+
+
+def ensureScrapeJob(prometheus_org, job_name, static_targets):
+    scrape_configs = prometheus_org.get('scrape_configs', [])
+    for scrape_config in scrape_configs:
+        if scrape_config.get('job_name') == job_name:
+            scrape_config['static_configs'][0]['targets'] = static_targets
+            return
+
+    scrape_configs.append({
+        'job_name': job_name,
+        'static_configs': [{'targets': static_targets}]
+    })
 
 # 함수명 : configYaml
 # 주요 기능 : 입력 받은 ip를 prometheus.yml 파일의 targets에 설정
@@ -300,10 +322,11 @@ def configYaml(cube, ccvm, scvm=None):
                     ccvm) + cubeProcessConfig(cube)  + ccvmProcessConfig(ccvm) + ccvmBlackboxConfigReplacement(ccvm)
                 prometheus_org['scrape_configs'][i]['relabel_configs'][-1]['replacement'] = ccvmBlackboxConfigReplacement(
                     ccvm)[0]
+    ensureScrapeJob(prometheus_org, 'host-license', hostLicenseConfig(cube))
 
-        with open(prometheus_yml_path, 'w') as yaml_file:
-            yaml_file.write(
-                yaml.dump(prometheus_org, default_flow_style=False))
+    with open(prometheus_yml_path, 'w') as yaml_file:
+        yaml_file.write(
+            yaml.dump(prometheus_org, default_flow_style=False))
 
 # 함수명 : configIni
 # 주요 기능 : grafana의 설정 파일에 도메인을 ccvm ip로 설정
