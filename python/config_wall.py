@@ -232,6 +232,12 @@ def configYaml(cube, ccvm, scvm=None):
 
     with open(prometheus_yml_path) as f:
         prometheus_org = yaml.safe_load(f)
+    if os_type == "ablestack-standalone":
+        scvm_jobs = {'scvm', 'scvm-process-exporter', 'scvm-blackbox'}
+        prometheus_org['scrape_configs'] = [
+            job for job in prometheus_org['scrape_configs']
+            if job.get('job_name') not in scvm_jobs
+        ]
     for i in range(len(prometheus_org['scrape_configs'])):
 
         if os_type == "ablestack-hci":
@@ -390,6 +396,24 @@ def configDS(scvm=None):  # 기본값 None 추가
     conn.commit()
     conn.close()
 
+    configGlueDsCron()
+
+
+def configGlueDsCron():
+    if os_type == "ablestack-standalone":
+        cron_path = '/var/spool/cron/root'
+        if os.path.exists(cron_path):
+            with open(cron_path) as cron_file:
+                lines = cron_file.readlines()
+            retained = [
+                line for line in lines
+                if line.lstrip().startswith('#') or 'config_wall.py glueDsUpdate' not in line
+            ]
+            if retained != lines:
+                with open(cron_path, 'w') as cron_file:
+                    cron_file.writelines(retained)
+        return
+
     exist_yn = os.system("crontab -l |grep 'config_wall.py glueDsUpdate' > /dev/null")
     if exist_yn != 0:
         os.system("echo -e \'*/5 * * * * /usr/bin/python3 /usr/share/ablestack/ablestack-wall/python/config_wall.py glueDsUpdate \' >> /var/spool/cron/root")
@@ -513,6 +537,8 @@ def initDB():
         pass
 
 def gluePrometheusIpUpdate():
+    if os_type == "ablestack-standalone":
+        return
     conn = sqlite3.connect(
             "/usr/share/ablestack/ablestack-wall/grafana/data/grafana.db")
 
@@ -632,7 +658,7 @@ def main():
                 configSkydiveLink(args.ccvm)
                 configMoldUserDashboard()
 
-                json.loads(sh.python3("/usr/share/ablestack/ablestack-wall/python/config_loki.py","config", "--ccvm", args.ccvm, "--cube", args.cube))
+                configLokiPromtail(args.ccvm, args.cube)
 
                 systemctl('stop', "grafana-server")
 
@@ -655,6 +681,8 @@ def main():
     if (args.action) == 'update':
         try:
             configYaml(args.cube, args.ccvm, args.scvm)
+            if os_type == "ablestack-standalone":
+                configGlueDsCron()
 
             ensureRemoteServices(args.cube, [
                 "node-exporter.service",
