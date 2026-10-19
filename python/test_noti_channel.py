@@ -25,7 +25,7 @@ def testNotification():
         key = apikey.readline()
 
     wall_ip = sys.argv[1]
-    url = 'http://admin:admin@' + wall_ip + \
+    url = 'http://admin:password@' + wall_ip + \
         ':3000/api/alert-notifications/test'
 
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json',

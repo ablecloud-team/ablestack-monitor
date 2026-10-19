@@ -23,7 +23,7 @@ def createApiKey():
     wall_ip = sys.argv[1]
     key_name = sys.argv[2]
     # HTTPS + 8081로 변경합니다.
-    url = 'https://admin:admin@' + wall_ip + \
+    url = 'https://admin:password@' + wall_ip + \
           ':8081/api/auth/keys'
 
     headers = {'Accept': 'application/json',
